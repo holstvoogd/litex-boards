@@ -8,9 +8,9 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 # Build/Use:
-# ./gsd_butterstick.py --uart-name=crossover --with-etherbone --csr-csv=csr.csv --build --load
-# litex_server --udp
-# litex_term crossover
+# ./gsd_butterstick.py --build --load
+
+import sys
 
 from migen import *
 from migen.genlib.resetsync import AsyncResetSynchronizer
@@ -30,16 +30,19 @@ from litedram.phy import ECP5DDRPHY
 
 from liteeth.phy.ecp5rgmii import LiteEthPHYRGMII
 
+from litex.build.generic_platform import *
+
 # CRG ---------------------------------------------------------------------------------------------
 
 class _CRG(Module):
     def __init__(self, platform, sys_clk_freq):
         self.rst = Signal()
         self.clock_domains.cd_init    = ClockDomain()
-        self.clock_domains.cd_por     = ClockDomain()
+        self.clock_domains.cd_por     = ClockDomain(reset_less=True)
         self.clock_domains.cd_sys     = ClockDomain()
         self.clock_domains.cd_sys2x   = ClockDomain()
-        self.clock_domains.cd_sys2x_i = ClockDomain()
+        self.clock_domains.cd_sys2x_i = ClockDomain(reset_less=True)
+        self.clock_domains.cd_usb     = ClockDomain()
 
         # # #
 
@@ -59,7 +62,7 @@ class _CRG(Module):
 
         # PLL
         self.submodules.pll = pll = ECP5PLL()
-        self.comb += pll.reset.eq(~por_done | ~rst_n | self.rst)
+        self.comb += pll.reset.eq(~por_done | ~rst_n)
         pll.register_clkin(clk30, 30e6)
         pll.create_clkout(self.cd_sys2x_i, 2*sys_clk_freq)
         pll.create_clkout(self.cd_init,   25e6)
@@ -74,8 +77,13 @@ class _CRG(Module):
                 i_CLKI    = self.cd_sys2x.clk,
                 i_RST     = self.reset,
                 o_CDIVX   = self.cd_sys.clk),
-            AsyncResetSynchronizer(self.cd_sys, ~pll.locked | self.reset),
+            AsyncResetSynchronizer(self.cd_sys,    ~pll.locked | self.reset),
+            AsyncResetSynchronizer(self.cd_usb,    ~pll.locked),
+            AsyncResetSynchronizer(self.cd_sys2x,  ~pll.locked | self.reset),
         ]
+
+        self.comb += self.cd_usb.clk.eq(self.cd_sys.clk)
+
 
 # BaseSoC ------------------------------------------------------------------------------------------
 
@@ -89,13 +97,37 @@ class BaseSoC(SoCCore):
         **kwargs)       :
         platform = gsd_butterstick.Platform(revision=revision, device=device ,toolchain=toolchain)
 
-        # CRG --------------------------------------------------------------------------------------
-        self.submodules.crg = _CRG(platform, sys_clk_freq)
+        vccio_ctrl = platform.request("vccio_ctrl")
 
-        # SoCCore ----------------------------------------------------------------------------------
+        self.sync.por += [
+            vccio_ctrl.pdm.eq(~vccio_ctrl.pdm),
+            vccio_ctrl.en.eq(1),
+        ]
+
         if kwargs["uart_name"] == "serial":
             kwargs["uart_name"] = "crossover"
+
+        with_usb_acm = kwargs["uart_name"] == "usb_acm"
+        if with_usb_acm:
+            kwargs["uart_name"] = "stream"
+
+        # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq, ident="LiteX SoC on ButterStick", **kwargs)
+
+        # Serial -----------------------------------------------------------------------------------
+        if with_usb_acm:
+            os.system("git clone https://github.com/gregdavill/luna-usb-serial-acm.git 2> /dev/null")
+            sys.path.append("luna-usb-serial-acm")
+            from USBSerialDevice import USBSerialDevice
+            self.submodules.usb_acm = usb_acm = USBSerialDevice(platform, platform.request('ulpi'))
+            self.comb += [
+                usb_acm.usb_rx.connect(self.uart.sink),
+                self.uart.source.connect(usb_acm.usb_tx, omit=['last']),
+                usb_acm.usb_tx.last.eq(1)
+            ]
+
+        # CRG --------------------------------------------------------------------------------------
+        self.submodules.crg = _CRG(platform, sys_clk_freq)
 
         # DDR3 SDRAM -------------------------------------------------------------------------------
         if not self.integrated_main_ram_size:
@@ -157,7 +189,7 @@ def main():
     target_group.add_argument("--build",           action="store_true",    help="Build design.")
     target_group.add_argument("--load",            action="store_true",    help="Load bitstream.")
     target_group.add_argument("--toolchain",       default="trellis",      help="FPGA toolchain (trellis or diamond).")
-    target_group.add_argument("--sys-clk-freq",    default=75e6,           help="System clock frequency.")
+    target_group.add_argument("--sys-clk-freq",    default=60e6,           help="System clock frequency.")
     target_group.add_argument("--revision",        default="1.0",          help="Board Revision (1.0).")
     target_group.add_argument("--device",          default="85F",          help="ECP5 device (25F, 45F, 85F).")
     target_group.add_argument("--sdram-device",    default="MT41K64M16",   help="SDRAM device (MT41K64M16, MT41K128M16, MT41K256M16 or MT41K512M16).")
